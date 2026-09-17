@@ -16,9 +16,11 @@ import html
 import http.server
 import os
 import posixpath
+import shutil
+import socket
 import sys
+import time
 import urllib.parse
-from functools import partial
 
 NAME = "pDrop"
 DEFAULT_ROOT = "/home/working" if os.path.isdir("/home/working") else os.path.expanduser("~")
@@ -70,9 +72,104 @@ def fmt_size(n: int) -> str:
     return "%.1f M" % (n / (1024 * 1024))
 
 
+def _read(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def lan_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("1.1.1.1", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        return "—"
+
+
+def mem_line() -> str:
+    info = {}
+    for line in _read("/proc/meminfo").splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            info[parts[0].rstrip(":")] = int(parts[1]) * 1024
+    total = info.get("MemTotal") or 0
+    avail = info.get("MemAvailable") or info.get("MemFree") or 0
+    if not total:
+        return "mem —"
+    used = total - avail
+    return "mem %s / %s" % (fmt_size(used), fmt_size(total))
+
+
+def load_line() -> str:
+    raw = _read("/proc/loadavg")
+    if not raw:
+        return "load —"
+    return "load " + " ".join(raw.split()[:3])
+
+
+def uptime_line() -> str:
+    raw = _read("/proc/uptime").split()
+    if not raw:
+        return "up —"
+    try:
+        sec = int(float(raw[0]))
+    except ValueError:
+        return "up —"
+    d, sec = divmod(sec, 86400)
+    h, sec = divmod(sec, 3600)
+    m, _ = divmod(sec, 60)
+    if d:
+        return "up %dd %dh" % (d, h)
+    return "up %dh %dm" % (h, m)
+
+
+def disk_line(root: str) -> str:
+    try:
+        u = shutil.disk_usage(root)
+    except OSError:
+        return "disk —"
+    return "disk %s / %s" % (fmt_size(u.used), fmt_size(u.total))
+
+
+def temp_line() -> str:
+    for path in (
+        "/sys/class/thermal/thermal_zone0/temp",
+        "/sys/class/hwmon/hwmon0/temp1_input",
+    ):
+        raw = _read(path)
+        if raw.isdigit():
+            t = int(raw)
+            if t > 1000:
+                t = t / 1000.0
+            return "cpu %.0f°C" % t
+    return "cpu —"
+
+
+def status_board(root: str) -> str:
+    host = socket.gethostname()
+    cells = [
+        host,
+        lan_ip(),
+        time.strftime("%H:%M"),
+        uptime_line(),
+        load_line(),
+        mem_line(),
+        disk_line(root),
+        temp_line(),
+    ]
+    bits = "".join("<div class=cell>%s</div>" % html.escape(c) for c in cells)
+    return "<section class=board>%s</section>" % bits
+
+
 PAGE = """<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="20">
 <title>pDrop %s</title>
 <style>
 body{font:15px/1.4 system-ui,sans-serif;background:#111;color:#ddd;margin:0}
@@ -91,12 +188,15 @@ input[type=text],input[type=file]{background:#222;color:#eee;border:1px solid #4
 button{background:#262;color:#dfd;border:0;padding:6px 12px;cursor:pointer}
 button.danger{background:#622}
 .crumb{margin:0;font-size:13px;color:#888}
+.board{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 16px}
+.cell{background:#161616;border:1px solid #2a2a2a;padding:8px 12px;font:13px/1.2 ui-monospace,monospace;color:#8f8}
 </style></head><body>
 <header>
   <h1>pDrop</h1>
   <p class="crumb">%s</p>
 </header>
 <main>
+%s
 %s
 </main></body></html>
 """
@@ -158,7 +258,7 @@ def listing_html(root: str, path: str) -> str:
         "<input type=text name=name placeholder=new-folder>",
         "<button>mkdir</button></form>",
     ]
-    return PAGE % (html.escape(wp), crumbs(wp), "\n".join(body))
+    return PAGE % (html.escape(wp), crumbs(wp), status_board(root), "\n".join(body))
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
